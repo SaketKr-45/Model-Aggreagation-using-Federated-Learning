@@ -31,3 +31,4 @@ Terminal 2 (Client 1):python new_client1.py
 Terminal 3 (Client 2):python new_client2.py
 Terminal 4 (Client 3):python new_client3.py
 The server will begin the training process as soon as all three clients have successfully connected. You will see output in the server terminal as it saves the model from each round.
+
