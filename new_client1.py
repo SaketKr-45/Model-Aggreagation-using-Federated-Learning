@@ -1,8 +1,9 @@
 import flwr as fl
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 import pandas as pd
+import numpy as np
 
 #pytorch model
 class Net(nn.Module):
@@ -33,8 +34,12 @@ class CustomDataset(Dataset):
         for col in categorical_cols:
             df[col] = df[col].astype("category").cat.codes
 
-        #Spliting dataset
-        self.X = torch.tensor(df.drop(columns=["FraudLabel"]).values, dtype=torch.float32)
+        #Normalizing features to zero mean and unit variance
+        X = df.drop(columns=["FraudLabel"]).values.astype(np.float32)
+        mean = X.mean(axis=0)
+        std = X.std(axis=0)
+        std[std == 0] = 1.0
+        self.X = torch.tensor((X - mean) / std, dtype=torch.float32)
         self.y = torch.tensor(df["FraudLabel"].values, dtype=torch.long)
 
     def __len__(self):
@@ -50,7 +55,15 @@ class FlowerClient(fl.client.NumPyClient):
         self.model = model
         self.trainloader = trainloader
         self.valloader = valloader
-        self.criterion = nn.CrossEntropyLoss()
+
+        #Compute class weights to handle severe class imbalance (~99% non-fraud)
+        ds = trainloader.dataset
+        y_train = ds.y if hasattr(ds, 'y') else ds.dataset.y[list(ds.indices)]
+        class_counts = torch.bincount(y_train)
+        total = y_train.shape[0]
+        class_weights = total / (len(class_counts) * class_counts.float())
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
 
     def get_parameters(self, config=None):
@@ -91,8 +104,15 @@ class FlowerClient(fl.client.NumPyClient):
 
 
 if __name__ == "__main__":
-    trainloader = DataLoader(CustomDataset("datasets\client1_dataset.csv"), batch_size=32, shuffle=True)
-    valloader = DataLoader(CustomDataset("datasets\client1_dataset.csv"), batch_size=32)
+    dataset = CustomDataset("datasets/client1_dataset.csv")
+
+    #Split into train and validation sets
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    trainset, valset = random_split(dataset, [train_size, val_size])
+
+    trainloader = DataLoader(trainset, batch_size=32, shuffle=True)
+    valloader = DataLoader(valset, batch_size=32)
 
     model = Net()
 
