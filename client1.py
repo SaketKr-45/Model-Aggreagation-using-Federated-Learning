@@ -1,92 +1,106 @@
-import flwr as fl
+import os
+import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import flwr as fl
+from pathlib import Path
 
-# --- Define a simple model (example: for MNIST) ---
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        self.fc1 = nn.Linear(28 * 28, 128)
-        self.fc2 = nn.Linear(128, 10)
+from utils import (
+    set_seed, load_and_preprocess, make_torch_dataset,
+    get_model_parameters, set_model_parameters, compute_metrics,
+)
+
+class SimpleModel(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 32)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(32, 1)
 
     def forward(self, x):
-        x = x.view(-1, 28 * 28)
-        x = torch.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+        return self.fc2(self.relu(self.fc1(x)))
+    
+class UpgradedModel(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
 
-# --- Load local data ---
-def load_data():
-    transform = transforms.Compose([transforms.ToTensor()])
-    dataset = datasets.MNIST("./data", train=True, download=True, transform=transform)
+    def forward(self, x):
+        return self.net(x)
 
-    # Split into train and validation (local only)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    trainset, valset = random_split(dataset, [train_size, val_size])
-
-    trainloader = DataLoader(trainset, batch_size=32, shuffle=True)
-    valloader = DataLoader(valset, batch_size=32)
-    return trainloader, valloader
-
-# --- Define Flower client ---
 class FlowerClient(fl.client.NumPyClient):
-    def __init__(self, model, trainloader, valloader):
-        self.model = model
-        self.trainloader = trainloader
-        self.valloader = valloader
+    def __init__(self, cid: str, dataset_path: str):
+        self.cid = cid
+        self.dataset_path = dataset_path
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+
+        X_train, X_test, y_train, y_test, feature_count, _ = load_and_preprocess(dataset_path)
+        self.y_test = y_test
+
+        self.train_loader = DataLoader(make_torch_dataset(X_train, y_train), batch_size=32, shuffle=True)
+        self.test_loader = DataLoader(make_torch_dataset(X_test, y_test), batch_size=32, shuffle=False)
+
+        self.model = SimpleModel(feature_count).to(self.device)
+        pos_weight = torch.tensor([3.0]).to(self.device) 
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     def get_parameters(self, config):
-        return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
-
-    def set_parameters(self, parameters):
-        state_dict = self.model.state_dict()
-        for k, v in zip(state_dict.keys(), parameters):
-            state_dict[k] = torch.tensor(v)
-        self.model.load_state_dict(state_dict, strict=True)
+        return get_model_parameters(self.model)
 
     def fit(self, parameters, config):
-        self.set_parameters(parameters)
+        set_model_parameters(self.model, parameters)
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.model.train()
-        optimizer = optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
-        criterion = nn.CrossEntropyLoss()
-
-        for epoch in range(1):  # one local epoch per round
-            for data, target in self.trainloader:
-                data, target = data.to(self.device), target.to(self.device)
+        
+        for _ in range(config.get("local_epochs", 2)):
+            for xb, yb in self.train_loader:
+                xb, yb = xb.to(self.device), yb.to(self.device)
                 optimizer.zero_grad()
-                output = self.model(data)
-                loss = criterion(output, target)
+                loss = self.criterion(self.model(xb), yb)
                 loss.backward()
                 optimizer.step()
 
-        return self.get_parameters(config={}), len(self.trainloader.dataset), {}
+        return get_model_parameters(self.model), len(self.train_loader.dataset), {}
 
     def evaluate(self, parameters, config):
-        self.set_parameters(parameters)
+        set_model_parameters(self.model, parameters)
         self.model.eval()
-        criterion = nn.CrossEntropyLoss()
-        loss, correct = 0.0, 0
+        losses, probs_all = [], []
 
         with torch.no_grad():
-            for data, target in self.valloader:
-                data, target = data.to(self.device), target.to(self.device)
-                output = self.model(data)
-                loss += criterion(output, target).item()
-                pred = output.argmax(1, keepdim=True)
-                correct += pred.eq(target.view_as(pred)).sum().item()
+            for xb, yb in self.test_loader:
+                xb, yb = xb.to(self.device), yb.to(self.device)
+                logits = self.model(xb)
+                losses.append(self.criterion(logits, yb).item())
+                probs_all.extend(torch.sigmoid(logits).cpu().numpy().flatten().tolist())
 
-        accuracy = correct / len(self.valloader.dataset)
-        return float(loss), len(self.valloader.dataset), {"accuracy": accuracy}
+        os.makedirs("predictions/clients", exist_ok=True)
+        y_prob = np.array(probs_all)
 
-# --- Start client ---
+        np.save(f"predictions/clients/client_{self.cid}_y_true.npy", self.y_test)
+        np.save(f"predictions/clients/client_{self.cid}_y_prob.npy", y_prob)
+
+        print(f"[Client {self.cid}] Predictions saved ✅")
+        return float(sum(losses) / len(losses)), len(self.test_loader.dataset), compute_metrics(self.y_test, y_prob)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--server", type=str, default="127.0.0.1:8080")
+    args = parser.parse_args()
+
+    set_seed(42)
+    client = FlowerClient(cid="1", dataset_path="datasets\\random_split\\dataset_random_split1.csv")
+    fl.client.start_numpy_client(server_address=args.server, client=client)
+
 if __name__ == "__main__":
-    model = Net()
-    trainloader, valloader = load_data()
-    client = FlowerClient(model, trainloader, valloader)
-    fl.client.start_numpy_client(server_address="localhost:8080", client=client)
+    main()
